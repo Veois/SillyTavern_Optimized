@@ -51,6 +51,9 @@ import { router as dataMaidRouter } from './endpoints/data-maid.js';
 import { router as backupsRouter } from './endpoints/backups.js';
 import { router as imageMetadataRouter } from './endpoints/image-metadata.js';
 import { router as volcengineRouter } from './endpoints/volcengine.js';
+import { writeCharacterIndex } from './endpoints/characters.js';
+import { getAllUserHandles, getUserDirectories } from './users.js';
+import { getConfigValue } from './util.js';
 
 /**
  * @typedef {object} ServerStartupResult
@@ -447,6 +450,20 @@ export class ServerStartup {
         const [v6Failed, v4Failed, v6Error, v4Error] = await this.#startHTTPorHTTPS(useIPv6, useIPv4);
         const result = { v6Failed, v4Failed, v6Error, v4Error, useIPv6, useIPv4 };
         this.#handleServerListenFail(result);
+        // After server listen, build character index for all users if lazy load is enabled
+        const useShallowCharacters = !!getConfigValue('performance.lazyLoadCharacters', false, 'boolean');
+        if (useShallowCharacters) {
+            try {
+                const userHandles = await getAllUserHandles();
+                for (const handle of userHandles) {
+                    const directories = getUserDirectories(handle);
+                    await writeCharacterIndex(directories.characters);
+                }
+                console.log('Character indexes built for all users.');
+            } catch (e) {
+                console.error('Failed to build character indexes at startup:', e);
+            }
+        }
         return result;
     }
 }
