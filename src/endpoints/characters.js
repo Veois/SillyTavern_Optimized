@@ -1019,8 +1019,113 @@ async function importFromPng(uploadPath, { request }, preservedFileName) {
     return '';
 }
 
+
+/**
+ * Helper to build a minimal character index from PNG files.
+ * @param {string} charactersDir - Directory containing character PNGs
+ * @returns {Promise<Array>} - Array of minimal character info
+ */
+async function buildCharacterIndex(charactersDir) {
+    const files = await fsPromises.readdir(charactersDir);
+    const pngFiles = files.filter(file => file.endsWith('.png'));
+    const chatsRoot = path.join(path.dirname(charactersDir), 'chats');
+
+    const index = await Promise.all(pngFiles.map(async (file) => {
+        try {
+            const imgPath = path.join(charactersDir, file);
+            const imgData = await readCharacterData(imgPath);
+            if (imgData === undefined) return null;
+
+            // Parse embedded JSON from the PNG
+            let raw = JSON.parse(imgData);
+            if (raw && raw.spec !== undefined) {
+                raw = readFromV2(raw);
+            }
+
+            const stat = fs.statSync(imgPath);
+            const chatsDirectory = path.join(chatsRoot, file.replace('.png', ''));
+            const { chatSize, dateLastChat } = calculateChatSize(chatsDirectory);
+
+            const name = _.get(raw, 'name') || _.get(raw, 'data.name', '');
+            if (!name) return null;
+
+            const tags = _.get(raw, 'data.tags', _.get(raw, 'tags', [])) || [];
+            const favExt = _.get(raw, 'data.extensions.fav', _.get(raw, 'fav', false)) || false;
+            const create_date = raw.create_date || humanizedDateTime(stat.ctimeMs);
+            const data_size = calculateDataSize(raw?.data);
+
+            const character_version = _.get(raw, 'data.character_version', '');
+            const creator = _.get(raw, 'data.creator', '');
+            const creator_notes = _.get(raw, 'data.creator_notes', '');
+
+            const chat = raw.chat || `${name} - ${humanizedDateTime()}`;
+
+            return {
+                shallow: true,
+                type: 'character',
+                name,
+                avatar: file,
+                chat,
+                fav: favExt,
+                date_added: stat.ctimeMs,
+                create_date,
+                date_last_chat: dateLastChat,
+                chat_size: chatSize,
+                data_size,
+                tags,
+                data: {
+                    name,
+                    character_version,
+                    creator,
+                    creator_notes,
+                    tags,
+                    extensions: {
+                        fav: favExt,
+                    },
+                },
+            };
+        } catch {
+            return null;
+        }
+    }));
+
+    return index.filter(i => i && i.type === 'character' && i.name && i.avatar);
+}
+
+/**
+ * Write the character index to disk.
+ */
+export async function writeCharacterIndex(charactersDir) {
+    const index = await buildCharacterIndex(charactersDir);
+    const indexPath = path.join(charactersDir, 'characters-index.json');
+    await fsPromises.writeFile(indexPath, JSON.stringify(index, null, 2));
+}
+
+/**
+ * Read the character index from disk, or rebuild if missing.
+ */
+async function readCharacterIndex(charactersDir) {
+    const indexPath = path.join(charactersDir, 'characters-index.json');
+    try {
+        const data = await fsPromises.readFile(indexPath, 'utf-8');
+        return JSON.parse(data);
+    } catch (e) {
+        // If not found or error, rebuild
+        await writeCharacterIndex(charactersDir);
+        const data = await fsPromises.readFile(indexPath, 'utf-8');
+        return JSON.parse(data);
+    }
+}
 export const router = express.Router();
 
+router.get('/index', async function (request, response) {
+    try {
+        const index = await readCharacterIndex(request.user.directories.characters);
+        response.json(index);
+    } catch (err) {
+        response.status(500).json({ error: 'Failed to load character index.' });
+    }
+});
 router.post('/create', getFileNameValidationFunction('file_name'), async function (request, response) {
     try {
         if (!request.body) return response.sendStatus(400);
@@ -1036,11 +1141,13 @@ router.post('/create', getFileNameValidationFunction('file_name'), async functio
 
         if (!request.file) {
             await writeCharacterData(DEFAULT_AVATAR_PATH, char, internalName, request);
+            await writeCharacterIndex(request.user.directories.characters);
             return response.send(avatarName);
         } else {
             const crop = tryParse(request.query.crop);
             const uploadPath = path.join(request.file.destination, request.file.filename);
             await writeCharacterData(uploadPath, char, internalName, request, crop);
+            await writeCharacterIndex(request.user.directories.characters);
             fs.unlinkSync(uploadPath);
             return response.send(avatarName);
         }
@@ -1089,6 +1196,7 @@ router.post('/rename', validateAvatarUrlMiddleware, async function (request, res
 
         // Remove the old character file
         fs.unlinkSync(oldAvatarPath);
+        await writeCharacterIndex(request.user.directories.characters);
 
         // Return new avatar name to ST
         return response.send({ avatar: newAvatarName });
@@ -1131,6 +1239,8 @@ router.post('/edit', validateAvatarUrlMiddleware, async function (request, respo
             // Bust cache to reload the new avatar
             cacheBuster.bust(request, response);
         }
+
+                await writeCharacterIndex(request.user.directories.characters);
 
         return response.sendStatus(200);
     } catch (err) {
@@ -1224,6 +1334,7 @@ router.post('/edit-attribute', validateAvatarUrlMiddleware, async function (requ
         let newCharJSON = JSON.stringify(char);
         const targetFile = (request.body.avatar_url).replace('.png', '');
         await writeCharacterData(avatarPath, newCharJSON, targetFile, request);
+                await writeCharacterIndex(request.user.directories.characters);
         return response.sendStatus(200);
     } catch (err) {
         console.error('An error occurred, character edit invalidated.', err);
@@ -1392,6 +1503,7 @@ router.post('/merge-attributes', getFileNameValidationFunction('avatar'), async 
             for (let i = 0; i < targetAvatars.length; i += BULK_MERGE_CONCURRENCY) {
                 const batch = targetAvatars.slice(i, i + BULK_MERGE_CONCURRENCY);
                 await Promise.allSettled(batch.map(processOne));
+            await writeCharacterIndex(request.user.directories.characters);
             }
 
             return response.send({ updated, skipped, failed });
@@ -1403,6 +1515,7 @@ router.post('/merge-attributes', getFileNameValidationFunction('avatar'), async 
 
         const result = await mergeCharacterUpdate(avatarPath, update.avatar, update, request);
         if (result.ok) {
+            await writeCharacterIndex(request.user.directories.characters);
             response.sendStatus(200);
         } else {
             console.warn(result.error);
@@ -1446,6 +1559,8 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
         }
     }
 
+        await writeCharacterIndex(request.user.directories.characters);
+
     return response.sendStatus(200);
 });
 
@@ -1465,7 +1580,11 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
  */
 router.post('/all', async function (request, response) {
     try {
-        const files = fs.readdirSync(request.user.directories.characters);
+
+        if (useShallowCharacters) {
+            const index = await readCharacterIndex(request.user.directories.characters);
+            return response.send(index);
+        }        const files = fs.readdirSync(request.user.directories.characters);
         const pngFiles = files.filter(file => file.endsWith('.png'));
         const processingPromises = pngFiles.map(file => processCharacter(file, request.user.directories, { shallow: useShallowCharacters }));
         const data = (await Promise.all(processingPromises)).filter(c => c.name);
@@ -1591,6 +1710,8 @@ router.post('/import', async function (request, response) {
             invalidateThumbnail(request.user.directories, 'avatar', `${preservedFileName}.png`);
         }
 
+                await writeCharacterIndex(request.user.directories.characters);
+
         response.send({ file_name: fileName });
     } catch (err) {
         console.error(err);
@@ -1635,6 +1756,7 @@ router.post('/duplicate', validateAvatarUrlMiddleware, async function (request, 
         }
 
         fs.copyFileSync(filename, newFilename);
+        await writeCharacterIndex(request.user.directories.characters);
         console.info(`${filename} was copied to ${newFilename}`);
         response.send({ path: path.parse(newFilename).base });
     } catch (error) {
